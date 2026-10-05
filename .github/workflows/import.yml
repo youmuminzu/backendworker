@@ -1,0 +1,96 @@
+# 数据导入定时任务
+#
+# 每天北京时间 03:00 运行（GitHub Actions 的 cron 一律按 UTC 解析：
+# 北京时间 UTC+8，03:00 CST = 前一天 19:00 UTC）。
+#
+# Storage 走 r2 模式：CSV / JSON 全部由程序直接读写 R2，
+# `_new.csv → _old.csv` 的改名也发生在 R2 里（storage.py 的 rename = copy + delete）。
+# 所以 runner **不需要任何本地快照**，没有下载/上传的步骤，也不需要缓存。
+# 本地 Data 目录那套 LocalStorage 只用于开发调试。
+#
+# 需要的 Secrets（Settings → Secrets and variables → Actions）：
+#   CLOUDFLARE_API_TOKEN      有 D1 编辑权限的 API Token
+#   CLOUDFLARE_ACCOUNT_ID     Cloudflare 账号 ID
+#   CLOUDFLARE_D1_DATABASE_ID D1 数据库 ID（可选，缺省用 config.py 里的默认值）
+#   R2_ACCESS_KEY_ID          R2 的 Access Key
+#   R2_SECRET_ACCESS_KEY      R2 的 Secret Key
+#   R2_BUCKET                 桶名，如 middle-bucket
+#   R2_ENDPOINT_URL           S3 API 端点，如 https://<account_id>.r2.cloudflarestorage.com
+
+name: Data Import
+
+on:
+  schedule:
+    - cron: "0 19 * * *" # 北京时间每天 03:00
+  workflow_dispatch:
+    inputs:
+      init_ddl:
+        description: "同时执行建表脚本（首次部署或改了表结构时用）"
+        type: boolean
+        default: false
+      rebuild_stats:
+        description: "强制重算 stats 计数表"
+        type: boolean
+        default: false
+
+# 同一时间只允许一个导入任务在跑；排队而不是互相打断，避免并发写库
+concurrency:
+  group: data-import
+  cancel-in-progress: false
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    env:
+      # 数据源模式：local / r2
+      BACKENDWORKER_STORAGE: r2
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_D1_DATABASE_ID: ${{ secrets.CLOUDFLARE_D1_DATABASE_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+      R2_PREFIX: processeddata
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: 安装依赖
+        run: uv sync
+
+      - name: 运行数据导入
+        id: importer
+        run: |
+          args=()
+          if [ "${{ inputs.init_ddl }}" = "true" ]; then args+=(--init-ddl); fi
+          if [ "${{ inputs.rebuild_stats }}" = "true" ]; then args+=(--rebuild-stats); fi
+          uv run python -m backendworker.importer "${args[@]}" 2>&1 | tee import.log
+
+      - name: 写入 Job Summary
+        if: always()
+        run: |
+          {
+            echo "## 导入结果"
+            echo
+            echo '```'
+            tail -n 40 import.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上传完整日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: import-log-${{ github.run_number }}
+          path: import.log
+          if-no-files-found: ignore
