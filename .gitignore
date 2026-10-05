@@ -12,3 +12,4 @@ processeddata/
 # Secrets
 .env
 R2keys.conf
+.workbuddy
