@@ -13,3 +13,4 @@ processeddata/
 .env
 R2keys.conf
 .workbuddy
+*.bak
