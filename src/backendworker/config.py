@@ -20,6 +20,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DATABASE_NAME = "datacabsite"
 DEFAULT_DATABASE_ID = "f42c3293-63b2-4ca3-a3b4-942a1d7fb926"
 DEFAULT_D1_API_BASE = "https://api.cloudflare.com/client/v4"
+# 数据在 R2 桶里的目录（对象存储的「目录」只是 key 的公共前缀）
+DEFAULT_R2_PREFIX = "data_product_files"
 
 _ENV_MAP = {
     "api_token": ("CLOUDFLARE_API_TOKEN", "CF_API_TOKEN", "D1_API_TOKEN"),
@@ -80,7 +82,7 @@ class Config:
     r2_endpoint_url: str = ""
     r2_access_key_id: str = ""
     r2_secret_access_key: str = ""
-    r2_prefix: str = "processeddata"    # 桶内的目录前缀
+    r2_prefix: str = DEFAULT_R2_PREFIX  # 桶内的目录前缀，如 data_product_files
 
     database_name: str = field(default=DEFAULT_DATABASE_NAME)
     api_base: str = DEFAULT_D1_API_BASE
@@ -134,7 +136,9 @@ def load_config(
         r2_endpoint_url=pick("r2_endpoint_url", "ENDPOINT_URL"),
         r2_access_key_id=pick("r2_access_key_id", "ACCESS_KEY_ID"),
         r2_secret_access_key=pick("r2_secret_access_key", "SECRET_ACCESS_KEY"),
-        r2_prefix=_from_env("r2_prefix") or "processeddata",
+        # 允许把 R2_PREFIX 显式设为空串（表示文件就在桶根目录），
+        # 所以这里判断的是「有没有设」而不是「设的值真不真」
+        r2_prefix=_from_env("r2_prefix") if "R2_PREFIX" in os.environ else DEFAULT_R2_PREFIX,
     )
 
     if mode == "r2" and not (cfg.r2_bucket and cfg.r2_endpoint_url):

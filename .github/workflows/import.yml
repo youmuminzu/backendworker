@@ -53,7 +53,9 @@ jobs:
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       R2_BUCKET: ${{ secrets.R2_BUCKET }}
       R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
-      R2_PREFIX: processeddata
+      # 数据在桶里的目录前缀（对象存储的「目录」只是 key 的公共前缀）
+      # 也就是 R2 控制台里那个 data_product_files 文件夹
+      R2_PREFIX: data_product_files
 
     steps:
       - name: 检出代码

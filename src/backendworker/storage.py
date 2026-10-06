@@ -113,6 +113,10 @@ class R2Storage:
       改名严格发生在「该站点全部写库成功」之后，中途崩溃时文件仍叫 `_new.csv`，
       下次重跑会按同样的 diff 重算。
     - `list_files()`：返回去除前缀后的文件名（不含子目录）。
+
+    关于「目录」：对象存储里的目录只是 key 的公共前缀，没有真实目录。
+    本类用一个 `prefix` 表达「数据在桶里的哪个目录下」（如 `data_product_files`），
+    所有读写都自动拼在它下面。当前约定该目录下是**扁平**的文件列表。
     """
 
     def __init__(
@@ -144,7 +148,11 @@ class R2Storage:
     # ---- key 处理
 
     def _key(self, name: str) -> str:
-        """只取文件名部分（防路径穿越），再拼上统一前缀。"""
+        """只取文件名部分（防路径穿越），再拼上统一前缀。
+
+        传 `"data_product_files/beijing_new.csv"` 和传 `"beijing_new.csv"` 等价——
+        都会落到 `<prefix>/beijing_new.csv`。
+        """
         base = Path(name).name
         return f"{self.prefix}/{base}" if self.prefix else base
 
@@ -155,12 +163,18 @@ class R2Storage:
             kwargs["Prefix"] = self.prefix + "/"
         for page in paginator.paginate(**kwargs):
             for obj in page.get("Contents", []):
-                yield obj["Key"]
+                key = obj["Key"]
+                # 跳过目录占位对象：控制台建「文件夹」会生成一个 0 字节、
+                # 以 / 结尾的 key，它不是文件
+                if key.endswith("/"):
+                    continue
+                yield key
 
     # ---- 协议实现
 
     def list_files(self) -> list[str]:
-        return sorted(key.rsplit("/", 1)[-1] for key in self._iter_keys())
+        names = (key.rsplit("/", 1)[-1] for key in self._iter_keys())
+        return sorted(name for name in names if name)
 
     def read_csv(self, name: str) -> list[dict[str, str]]:
         text = self._read_text(name, encoding="utf-8-sig")  # 同样要消 BOM

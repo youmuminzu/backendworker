@@ -143,7 +143,10 @@ def run(args: argparse.Namespace) -> int:
         log.error("数据目录不存在：%s", cfg.data_dir)
         return 2
 
-    log.info("数据源 storage=%s", cfg.storage_mode)
+    if cfg.storage_mode == "r2":
+        log.info("数据源 storage=r2（s3://%s/%s）", cfg.r2_bucket, cfg.r2_prefix or "<桶根目录>")
+    else:
+        log.info("数据源 storage=local（%s）", cfg.data_dir)
 
     storage = create_storage(cfg)
     initialize(verbose=args.verbose)
