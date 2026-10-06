@@ -33,8 +33,6 @@ CREATE TABLE IF NOT EXISTS product (
     source      TEXT,                                               -- 数源机构
     detail_url  TEXT,                                               -- 详情页地址
     update_at   TEXT                                                -- 本行最后一次插入/更新的时间（导入端写入，YYYY-MM-DD HH:MM:SS）
-    -- 刻意不建 UNIQUE(market_id, raw_data_key)：
-    --   D1 的「已写入行数」把索引写入也计入，唯一约束会隐式建索引 → 每行多算一次写入。
     --   去重改由导入端在写入前先查 (market_id, raw_data_key) 是否存在来保证（见 product_sync）。
 );
 
