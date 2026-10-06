@@ -2,7 +2,6 @@
 name = "backendworker"
 version = "0.1.0"
 description = "数据导入端：把 data-collector 产出的数据同步进 Cloudflare D1 并维护 FTS5 索引"
-readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "httpx>=0.28",
