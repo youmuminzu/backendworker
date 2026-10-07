@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 from typing import Sequence
 
-from .d1_client import D1Client, D1Error, chunks, quote
+from .d1_client import D1Client, D1Error, QuotaExceeded, chunks, quote
 from .state import now_str
 
 log = logging.getLogger(__name__)
@@ -82,6 +82,10 @@ def _category_counts(client: D1Client, category_ids: list[str]) -> list[tuple[st
 
     try:
         rows = client.query(union_sql)
+    except QuotaExceeded:
+        # 配额耗尽不是 FTS 的问题，回退成 LIKE 全扫描只会白烧 35 次读取配额，
+        # 而且结果一样拿不到。直接向上抛，让上层整轮中止。
+        raise
     except D1Error as exc:
         log.warning("FTS 分类计数失败（%s），回退为 product 表 LIKE 全扫描", exc)
         rows = _category_counts_by_like(client, category_ids)

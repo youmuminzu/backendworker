@@ -32,13 +32,18 @@ CREATE TABLE IF NOT EXISTS product (
     category_id TEXT NOT NULL,
     source      TEXT,                                               -- 数源机构
     detail_url  TEXT,                                               -- 详情页地址
-    update_at   TEXT                                                -- 本行最后一次插入/更新的时间（导入端写入，YYYY-MM-DD HH:MM:SS）
-    --   去重改由导入端在写入前先查 (market_id, raw_data_key) 是否存在来保证（见 product_sync）。
+    update_at   TEXT,                                               -- 本行最后一次插入/更新的时间（导入端写入，YYYY-MM-DD HH:MM:SS）
+    -- 业务主键：导入端的幂等基石。
+    -- 为什么必须有：批次中途失败时站点不改名、不写 sync_state，次日会整站重跑，
+    -- 而 CSV diff 仍会判定这些行「新增」。没有这个约束，纯 INSERT 会把已存在的
+    -- 行再插一遍，每失败一轮就累积一批重复。有了它，INSERT 走 ON CONFLICT DO UPDATE，
+    -- 重跑收敛到「更新为最新值」，重复数据就不会产生。
+    UNIQUE (market_id, raw_data_key)
 );
 
--- 只保留 market_id 索引：导入端所有定位语句都是 WHERE market_id=? AND raw_data_key IN (...)，
--- 没有它会退化成全表扫描。
-CREATE INDEX IF NOT EXISTS idx_product_market ON product(market_id);
+-- 不额外建 market_id 索引：UNIQUE(market_id, raw_data_key) 的最左前缀已是
+-- market_id，导入端所有定位语句都是 WHERE market_id=? AND raw_data_key IN (...)，
+-- 走这个唯一索引即可。索引每一条都要计入 D1 每日写入行数配额，不建冗余的。
 
 -- 不建 category_id 索引：该列是 || 拼接的多值串，B-tree 索引对多值前缀匹配无效；
 -- 分类检索走 product_fts 的 category_id 全文索引。
@@ -86,3 +91,25 @@ CREATE TABLE stats (
   updated_at TEXT,
   PRIMARY KEY (scope, stat_key)
 );
+
+-- ==========================================================
+-- 迁移说明：给已建好的库补 UNIQUE(market_id, raw_data_key)
+-- ==========================================================
+-- CREATE TABLE IF NOT EXISTS 不会修改已存在的表，所以旧库要手动补三步。
+-- 顺序不能颠倒：必须先清重复，再建唯一索引，否则 CREATE UNIQUE INDEX 会失败。
+--
+-- 步骤 1 —— 查重复（先看有多少要清理）：
+--   SELECT market_id, raw_data_key, COUNT(*) AS n
+--     FROM product GROUP BY market_id, raw_data_key HAVING n > 1;
+--
+-- 步骤 2 —— 清理重复，只保留 product_id 最小的一条：
+--   DELETE FROM product WHERE product_id NOT IN (
+--     SELECT MIN(product_id) FROM product GROUP BY market_id, raw_data_key);
+--
+-- 步骤 3 —— 补唯一索引（等价于新库的 UNIQUE 约束，冲突目标写法一致）：
+--   CREATE UNIQUE INDEX IF NOT EXISTS idx_product_market_key
+--     ON product(market_id, raw_data_key);
+--   DROP INDEX IF EXISTS idx_product_market;  -- 已由上一条覆盖，去掉冗余索引省写入配额
+--
+-- 注意：步骤 2 的 DELETE 与步骤 3 的 CREATE INDEX 都计入当日写入行数配额，
+-- 建议在配额充足时执行。

@@ -12,7 +12,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime
 
-from .d1_client import D1Client, quote
+from .d1_client import D1Client, QuotaExceeded, quote
 from .storage import Storage
 
 log = logging.getLogger(__name__)
@@ -74,6 +74,10 @@ def fetch_sync_state(client: D1Client) -> dict[str, str]:
     """读取 D1 中的 sync_state：{file_name: upload_at}。"""
     try:
         rows = client.query("SELECT file_name, upload_at FROM sync_state")
+    except QuotaExceeded:
+        # 配额错误绝不能被当成「表不存在」：那会让整轮按首次全量导入重跑，
+        # 把所有站点当成新增，白白烧掉本就不够的写入配额。
+        raise
     except Exception as exc:  # 表不存在等
         log.warning("读取 sync_state 失败（%s），按首次全量导入处理", exc)
         return {}

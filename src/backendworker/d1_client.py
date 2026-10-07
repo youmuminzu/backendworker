@@ -5,6 +5,8 @@ DESIGN.md §6.4：
 - 批量：单次请求携带多条 SQL 语句（严格转义字符串字面量），每批 200~500 行
 - 幂等由上层 UPSERT 保证；本层负责 429/5xx 指数退避重试（上限 5 次）与批间延迟
 - 降级：若远端不接受多语句脚本，自动切为「逐语句」模式继续跑
+- **配额豁免**：账号级每日行读/行写上限耗尽（`QuotaExceeded`）不进重试分支，
+  也不触发多语句降级 —— 它要到午夜 UTC 才重试，重试或降级都只是白烧时间
 """
 
 from __future__ import annotations
@@ -22,6 +24,14 @@ log = logging.getLogger(__name__)
 
 RETRYABLE_STATUS = {408, 425, 429, 500, 502, 503, 504}
 
+# Cloudflare 账号级每日行数配额耗尽的报错文案（见 D1 error list）。
+# 命中即视为 QuotaExceeded：午夜 UTC 才重置，任何重试/降级都无意义。
+QUOTA_MARKERS = (
+    "daily row write limit",
+    "daily row read limit",
+    "maximum account storage limit",
+)
+
 
 class D1Error(RuntimeError):
     """D1 返回业务错误（success=false 或单条语句执行失败）。"""
@@ -29,6 +39,25 @@ class D1Error(RuntimeError):
     def __init__(self, message: str, *, errors: list[Any] | None = None) -> None:
         super().__init__(message)
         self.errors = errors or []
+
+
+class QuotaExceeded(D1Error):
+    """账号级 D1 每日行读/行写配额已耗尽。
+
+    与 D1Error 的区别：这是**账号级、跨库、不可重试**的错误，
+    一直重试到 00:00 UTC 也不会成功。上层应当立即中止整轮导入，
+    而不是跳过单个站点继续跑（后面的站点同样会失败，只是白等退避）。
+    """
+
+
+def is_quota_error(value: Any) -> bool:
+    """按报错文案判定是否为配额耗尽。
+
+    D1 把这类错误放在 HTTP 400 的 `errors[].message`，或 HTTP 200 的
+    `result[].error` 里，两处都要认，所以只匹配文案不依赖 HTTP 状态码。
+    """
+    text = str(value).lower()
+    return any(marker in text for marker in QUOTA_MARKERS)
 
 
 # ------------------------------------------------------------------ 字面量转义
@@ -108,7 +137,14 @@ class D1Client:
                 delay *= 2
                 continue
 
-            # 2) 限流 / 服务端错误：可重试
+            # 2) 配额耗尽优先于一切状态码判断。
+            #    D1 常规把它放在 400 的 errors[].message 里，但保底也要防它
+            #    裹在 429/5xx 里（那样会被下面的退避重试白等 5 次）。
+            quota = self._detect_quota(resp)
+            if quota is not None:
+                raise quota
+
+            # 3) 限流 / 服务端错误：可重试
             if resp.status_code in RETRYABLE_STATUS:
                 last_error = httpx.HTTPStatusError(
                     f"HTTP {resp.status_code}", request=resp.request, response=resp
@@ -119,7 +155,7 @@ class D1Client:
                 delay *= 2
                 continue
 
-            # 3) 其余 4xx（400/401/403…）：请求本身有问题，重试无意义，
+            # 4) 其余 4xx（400/401/403…）：请求本身有问题，重试无意义，
             #    必须把 D1 返回的 body 抛出来，否则只能看到一串无信息量的 400
             if resp.status_code >= 400:
                 raise D1Error(
@@ -132,12 +168,52 @@ class D1Client:
                 raise D1Error(f"D1 返回非 JSON：{_http_body(resp)}")
 
             if not body.get("success"):
+                # 单条语句级失败也可能就是配额问题（放在 result[].error 里）
+                quota = self._quota_from_body(body)
+                if quota is not None:
+                    raise quota
                 raise D1Error(
                     f"D1 返回失败：{_brief(body.get('errors'))}", errors=body.get("errors") or []
                 )
             return body.get("result") or []
 
         raise D1Error(f"D1 请求重试 {self.cfg.max_retries} 次仍失败：{last_error}")
+
+    # ---- 配额识别
+
+    @staticmethod
+    def _quota_message(raw: Any) -> str | None:
+        """从一段报错文案里提取可读信息，命中配额关键词才返回。"""
+        for item in (raw if isinstance(raw, list) else [raw]):
+            message = item.get("message") if isinstance(item, dict) else item
+            if message and is_quota_error(message):
+                return str(message)
+        return None
+
+    def _quota_from_body(self, body: dict[str, Any]) -> QuotaExceeded | None:
+        """检查 HTTP 200 响应体里的 errors / result[].error。"""
+        for key in ("errors", "messages"):
+            message = self._quota_message(body.get(key))
+            if message:
+                return _quota_error(message)
+
+        for item in body.get("result") or []:
+            if isinstance(item, dict) and not item.get("success", True):
+                message = self._quota_message(item.get("error"))
+                if message:
+                    return _quota_error(message)
+        return None
+
+    def _detect_quota(self, resp: httpx.Response) -> QuotaExceeded | None:
+        """不限状态码地检查响应体是否在说「配额耗尽」。"""
+        if resp.status_code < 400:
+            return None  # 2xx 的配额错误由 _quota_from_body 处理
+        try:
+            body = resp.json()
+        except ValueError:
+            message = self._quota_message(resp.text)
+            return _quota_error(message) if message else None
+        return self._quota_from_body(body)
 
     def _backoff(self, reason: Any, delay: float, attempt: int) -> None:
         sleep = delay * (2 ** (attempt - 1)) + random.uniform(0, 0.3)
@@ -160,7 +236,10 @@ class D1Client:
         rows: list[dict[str, Any]] = []
         for item in results:
             if not item.get("success", True):
-                raise D1Error(f"SQL 执行失败：{_brief(item.get('error'))}\n---\n{sql[:300]}")
+                error = item.get("error")
+                if is_quota_error(error):
+                    raise _quota_error(error)
+                raise D1Error(f"SQL 执行失败：{_brief(error)}\n---\n{sql[:300]}")
             rows.extend(item.get("results") or [])
         self.stat_rows_returned += len(rows)
         return rows
@@ -175,6 +254,10 @@ class D1Client:
         - 逐语句同样失败 → 说明是某条 SQL 有问题，原样抛错并保持批量模式，
           避免一次偶发错误让后续所有批次退化成逐条请求。
         重复执行是安全的：上层所有写入均为 UPSERT / 先删后插的幂等形式。
+
+        `QuotaExceeded` 直接向上抛，不进降级路径：配额耗尽与「多语句支不支持」
+        毫无关系，逐语句重跑只会把同一个配额错误再撞一遍，并把日志误导成
+        「多语句脚本不被支持」。
         """
         if not statements:
             return
@@ -182,6 +265,8 @@ class D1Client:
             try:
                 self._post({"sql": build_script(statements)})
                 return
+            except QuotaExceeded:
+                raise
             except D1Error as exc:
                 log.warning("多语句脚本失败（%s），改用逐语句重试以定位原因", _brief(exc))
                 for stmt in statements:
@@ -229,6 +314,20 @@ def chunks(items: Iterable[Any], size: int) -> Iterator[list[Any]]:
 def _brief(value: Any, limit: int = 300) -> str:
     text = str(value)
     return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _quota_error(message: str) -> QuotaExceeded:
+    """构造带处置建议的 QuotaExceeded。
+
+    日志里必须写清三件事：D1 不会丢数据、什么时候恢复、为什么重试没用——
+    否则看到报错的人会以为数据库坏了，或以为重跑几轮就能补上。
+    """
+    return QuotaExceeded(
+        f"D1 每日行数配额已耗尽：{_brief(message)}\n"
+        "已写入的数据不会丢失，但本轮剩余写入都会被拒绝。\n"
+        "配额于次日 00:00 UTC（北京时间 08:00）重置；"
+        "本轮已提交的批次不会重放（写入均幂等，重跑安全）。"
+    )
 
 
 def _http_body(resp: "httpx.Response", limit: int = 800) -> str:

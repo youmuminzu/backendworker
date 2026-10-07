@@ -11,7 +11,8 @@ DESIGN.md §5 步骤 4 / §6.3 / §7：
 - 无 _old.csv 时全部视为新增（首次导入）
 - 变更检测：逐列比较除 raw_data_key 外的 7 个字段，任一不同即视为变更
 - 自增 id 获取：新增时用 `last_insert_rowid()` 就地写入 FTS；变更/下架用子查询取（见 ProductSyncer）
-- 不做任何 (market_id, raw_data_key) 存在性校验，新增一律纯 INSERT
+- 新增走 UPSERT（依赖 product 表的 UNIQUE(market_id, raw_data_key)），
+  批次中途失败后重跑收敛为「更新为最新值」，不会插出重复行
 - 导入端维护 `update_at` 列：INSERT / UPDATE 时写入当前时间。
   它不来自 CSV，因此不参与 diff 比较（COMPARE_FIELDS 只覆盖 CSV 列）
 """
@@ -20,9 +21,9 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Iterator, NamedTuple, Sequence
+from typing import NamedTuple, Sequence
 
-from .d1_client import D1Client, D1Error, chunks, quote, quote_or_null
+from .d1_client import D1Client, chunks, quote, quote_or_null
 from .meta_sync import MetaCatalog
 from .state import now_str
 from .storage import Storage
@@ -168,12 +169,13 @@ class ProductSyncer:
     """负责把单个站点的 diff 结果落到 D1（product + product_fts）。
 
     关键设计：**全程零回查**。不做 (market_id, raw_data_key) 存在性校验，
-    新增一律纯 INSERT（用户接受少量重复，另行脚本清理），
-    变更/下架直接按 key 定位，需要 product_id 时用 SQL 子查询就地取。
+    新增直接 UPSERT —— 靠 product 表的 UNIQUE(market_id, raw_data_key) 判重，
+    冲突时覆盖为最新值。这让「批次中途失败 → 次日整站重跑」天然幂等：
+    已提交的行被更新，未提交的行被插入，最终状态与一次成功写入完全一致。
 
     FTS 的 rowid 怎么拿到 product_id：
-        新增   → product 的 INSERT 与对应 FTS 的 INSERT 相邻放在同一个批处理脚本里，
-                  FTS 里写 `last_insert_rowid()`，SQLite 顺序执行，取到的就是刚插入那行的 id。
+        新增   → product 的 UPSERT 与对应 FTS 的 INSERT 相邻放在同一个批处理脚本里，
+                  FTS 里写 `last_insert_rowid()`，SQLite 顺序执行，取到的就是刚写入那行的 id。
         变更/下架 → `INSERT INTO product_fts(rowid, ...) SELECT product_id, ... FROM product WHERE ...`
                   / `DELETE FROM product_fts WHERE rowid IN (SELECT product_id FROM product WHERE ...)`
     """
@@ -242,41 +244,60 @@ class ProductSyncer:
     # ---------- 新增
 
     def _apply_added(self, rows: Sequence[ProductRow], market_id: str) -> None:
-        """纯 INSERT，不做任何存在性校验。
+        """UPSERT + 重建 FTS。
 
-        product 的 INSERT 与对应 FTS 的 INSERT **必须相邻且在同一批脚本里**：
-        FTS 那行用 `last_insert_rowid()` 取 product_id，靠的是 SQLite 在同一个会话里
-        顺序执行——一旦被拆到不同请求，取到的就不是本行的 id 了。
+        FTS 那行用子查询按 (market_id, raw_data_key) 取 product_id，
+        而不是 `last_insert_rowid()` —— 走 UPSERT 的 DO UPDATE 分支时
+        last_insert_rowid() 不会更新（它返回的是上一条 INSERT 的 rowid），
+        重跑时会把 FTS 写到别的行上。
+
+        **每行写入前必须先删掉对应的 FTS 记录**：FTS5 对同 rowid 重复 INSERT
+        会报 constraint failed。首次导入时 product 行是新的、删不到东西（无害）；
+        但配额中断后重跑时 product 行已存在，FTS 里也已有它，不先删就会失败。
+        这与 `_apply_changed` 用同一套「先删后插」逻辑。
+
+        附带好处：product 的 UPSERT 与 FTS 的写入不再必须相邻同批，
+        逐语句降级模式下也能正确工作，所以这里不再需要
+        `multi_statement_enabled` 的前置检查。
+
+        `market_id` 仅为与 `_apply_changed` / `_apply_removed` 签名一致而保留，
+        实际每行的 market_id 都取自 CSV 自身。
         """
         if not rows:
             return
-        if not self.client.multi_statement_enabled:
-            raise D1Error(
-                "当前 D1 不接受多语句脚本，已降级为逐语句模式；"
-                "此时 last_insert_rowid() 跨请求失效，无法安全写入 FTS，已中止。"
-            )
-        pairs = [
-            [self._insert_sql(row), self._fts_insert_values_sql(row, "last_insert_rowid()")]
-            for row in rows
-        ]
-        for batch in _chunk_pairs(pairs, self.cfg.batch_size, self.cfg.max_payload_bytes):
-            self.client.execute(batch)
+        statements: list[str] = []
+        for row in rows:
+            statements.append(self._insert_sql(row))
+            statements.append(self._fts_delete_sql(row.market_id, [row.raw_data_key]))
+            statements.append(self._fts_insert_select_sql(row))
+        for part in self.client.chunk_by_payload(statements):
+            self.client.execute(part)
             self.client.pace()
 
     @staticmethod
     def _insert_sql(row: ProductRow) -> str:
-        """纯 INSERT，同时写入 `update_at`（本次插入时间）。
+        """UPSERT：依赖 product 表的 UNIQUE(market_id, raw_data_key)。
 
-        product 表刻意不建 UNIQUE(market_id, raw_data_key)，因此这里不能带
-        `ON CONFLICT(market_id, raw_data_key)` 冲突目标（没有对应约束会直接报错）。
+        为什么新增也走 UPSERT 而不是纯 INSERT：
+        批次中途失败时，站点不改名、不写 sync_state，次日会拿同一份 _new.csv
+        整站重跑，而 CSV diff 仍会把这些行判为「新增」。纯 INSERT 会把上一轮
+        已落库的行再插一遍，重复数据每失败一轮就累积一批。UPSERT 让重跑收敛。
+
+        冲突时覆盖除 raw_data_key / market_id 外的全部 CSV 列 + update_at，
+        语义等价于「这行以本轮 CSV 为准」。
         """
+        assignments = ", ".join(
+            f"{name}=excluded.{name}" for name in COMPARE_FIELDS
+        )
         return (
             "INSERT INTO product (raw_data_key, title, description, tags, market_id, "
             f"category_id, source, detail_url, {DERIVED_COLUMN}) VALUES ("
             f"{quote(row.raw_data_key)}, {quote(row.title)}, {quote_or_null(row.description)}, "
             f"{quote_or_null(row.tags)}, {quote(row.market_id)}, {quote(row.category_id)}, "
             f"{quote_or_null(row.source)}, {quote_or_null(row.detail_url)}, "
-            f"{quote(now_str())})"
+            f"{quote(now_str())}) "
+            "ON CONFLICT(market_id, raw_data_key) DO UPDATE SET "
+            f"{assignments}, {DERIVED_COLUMN}=excluded.{DERIVED_COLUMN}"
         )
 
     @staticmethod
@@ -335,15 +356,12 @@ class ProductSyncer:
             f"{quote_or_null(fts['category_id'])}"
         )
 
-    def _fts_insert_values_sql(self, row: ProductRow, rowid_expr: str) -> str:
-        """rowid 由调用方给出：新增时传 `last_insert_rowid()`。"""
-        return (
-            "INSERT INTO product_fts (rowid, title, description, source, tags, category_id) "
-            f"VALUES ({rowid_expr}, {self._fts_values(row)})"
-        )
-
     def _fts_insert_select_sql(self, row: ProductRow) -> str:
-        """rowid 用子查询就地取，无需 Python 侧先查 id。"""
+        """rowid 用子查询就地取，无需Python 侧先查 id。
+
+        product 的写入与本语句在同一个批处理脚本里顺序执行，
+        所以查到的就是刚写入（或刚更新）的那一行。
+        """
         return (
             "INSERT INTO product_fts (rowid, title, description, source, tags, category_id) "
             f"SELECT product_id, {self._fts_values(row)} "
@@ -366,26 +384,3 @@ class ProductSyncer:
             f"DELETE FROM product WHERE market_id={quote(market_id)} "
             f"AND raw_data_key IN ({keys_sql})"
         )
-
-
-def _chunk_pairs(
-    pairs: Sequence[Sequence[str]],
-    max_statements: int,
-    max_bytes: int,
-) -> Iterator[list[str]]:
-    """按「语句对」切批——一对语句永不被拆到两个请求里。
-
-    新增路径里 (product INSERT, FTS INSERT) 是一对，
-    拆开会让后者的 last_insert_rowid() 取到别的值。
-    """
-    batch: list[str] = []
-    size = 0
-    for pair in pairs:
-        pair_size = sum(len(stmt.encode("utf-8")) + 2 for stmt in pair)
-        if batch and (len(batch) + len(pair) > max_statements or size + pair_size > max_bytes):
-            yield batch
-            batch, size = [], 0
-        batch.extend(pair)
-        size += pair_size
-    if batch:
-        yield batch

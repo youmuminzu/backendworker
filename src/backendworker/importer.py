@@ -17,7 +17,7 @@ import sys
 from pathlib import Path
 
 from .config import PROJECT_ROOT, Config, load_config
-from .d1_client import D1Client, D1Error
+from .d1_client import D1Client, D1Error, QuotaExceeded
 from .meta_sync import sync_metadata
 from .product_sync import ProductSyncer, SyncStats
 from .state import (
@@ -178,7 +178,15 @@ def run(args: argparse.Namespace) -> int:
             return 0
 
         # 步骤 2：触发判断
-        sync_state = {} if cfg.dry_run else fetch_sync_state(client)
+        # 配额错误在这里就必须拦住：它一旦被当成「sync_state 表不存在」，
+        # 后面所有站点都会被判为「首次出现」而当成新增重跑，正好撞上配额上限。
+        try:
+            sync_state = {} if cfg.dry_run else fetch_sync_state(client)
+        except QuotaExceeded as exc:
+            log.error("D1 配额耗尽，无法读取 sync_state，本轮中止（未改动任何数据）")
+            log.error("%s", exc)
+            return 3
+
         pending = compute_pending(entries, sync_state)
         if not pending:
             log.info("所有文件均无更新（upload_at 未变化），空跑保护退出")
@@ -186,7 +194,12 @@ def run(args: argparse.Namespace) -> int:
         log.info("待处理文件 %d 个：%s", len(pending), ", ".join(e.file_name for e in pending))
 
         # 步骤 3：元数据同步（每次都做，代价可忽略）
-        catalog = sync_metadata(client, storage)
+        try:
+            catalog = sync_metadata(client, storage)
+        except QuotaExceeded as exc:
+            log.error("D1 配额耗尽于元数据同步，本轮中止（未改动任何商品数据）")
+            log.error("%s", exc)
+            return 3
 
         # 步骤 4：逐站点处理
         syncer = ProductSyncer(client)
@@ -203,6 +216,14 @@ def run(args: argparse.Namespace) -> int:
                     failed.append(entry.file_name)
                     log.error("%s 未通过前置检查，跳过（不改名，下次会重算）", entry.file_name)
                     continue
+            except QuotaExceeded as exc:
+                # 账号级配额耗尽：后面的站点同样写不进去，
+                # 继续跑只会把剩余站点全标失败并浪费一整轮退避重试。
+                # 已提交的批次保持原样（写入幂等，重跑安全），下次整轮重来即可。
+                log.error("D1 配额耗尽，中止本轮导入（剩余 %d 个站点未处理）", len(pending) - len(summaries) - len(failed))
+                log.error("%s", exc)
+                print_summary(summaries, failed, client, cfg, aborted_by_quota=True)
+                return 3
             except Exception as exc:
                 failed.append(entry.file_name)
                 log.exception("%s 处理失败：%s（不改名，下次会重算）", entry.file_name, exc)
@@ -215,6 +236,14 @@ def run(args: argparse.Namespace) -> int:
             try:
                 upsert_sync_state(client, entry)  # 先记状态
                 storage.rename(entry.file_name, entry.old_name)  # 成功后再改名
+            except QuotaExceeded as exc:
+                # 商品已入库但状态没记、文件没改名 —— 下次会整站重跑。
+                # 这是安全的：新增走 UPSERT，重跑收敛为「更新为最新值」，不会插出重复行。
+                log.error("D1 配额耗尽于 %s 的收尾阶段：商品已入库，但 sync_state 未记录、文件未改名", entry.file_name)
+                log.error("%s", exc)
+                log.error("下次运行会整站重跑该站点（新增走 UPSERT，不会产生重复数据）")
+                print_summary(summaries, failed, client, cfg, aborted_by_quota=True)
+                return 3
             except Exception as exc:
                 failed.append(entry.file_name)
                 log.exception("%s 收尾失败（状态/改名）：%s", entry.file_name, exc)
@@ -225,6 +254,9 @@ def run(args: argparse.Namespace) -> int:
         if args.rebuild_stats or wrote:
             try:
                 stats_rows = rebuild_stats(client, sorted(catalog.categories))
+            except QuotaExceeded as exc:
+                log.error("D1 配额耗尽于 stats 重算：%s", exc)
+                failed.append("stats")
             except Exception as exc:
                 failed.append("stats")
                 log.exception("重算 stats 失败：%s", exc)
@@ -246,6 +278,7 @@ def print_summary(
     client: D1Client,
     cfg: Config,
     stats_rows: int = 0,
+    aborted_by_quota: bool = False,
 ) -> None:
     total = SyncStats(market_id="合计")
     lines = []
@@ -274,7 +307,12 @@ def print_summary(
             f"{total.unchanged:>8}{total.skipped:>8}{total.warnings:>8}"
         )
     lines.append("=" * len(header))
-    if failed:
+    if aborted_by_quota:
+        lines.append("本轮因 D1 每日行数配额耗尽而中止")
+        lines.append("已提交的站点已改名并记录状态，不会重复导入")
+        lines.append("未完成的站点下次整站重跑（新增走 UPSERT，不会产生重复数据）")
+        lines.append("配额于次日 00:00 UTC（北京时间 08:00）重置")
+    elif failed:
         lines.append(f"失败站点 {len(failed)} 个（未改名，下次仍会重跑）：{', '.join(failed)}")
     else:
         lines.append("全部站点处理成功")

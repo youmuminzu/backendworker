@@ -76,7 +76,17 @@ jobs:
           args=()
           if [ "${{ inputs.init_ddl }}" = "true" ]; then args+=(--init-ddl); fi
           if [ "${{ inputs.rebuild_stats }}" = "true" ]; then args+=(--rebuild-stats); fi
+          set -o pipefail
           uv run python -m backendworker.importer "${args[@]}" 2>&1 | tee import.log
+          code=${PIPESTATUS[0]}
+          # 退出码 3 = D1 每日行数配额耗尽。这不是故障：
+          # 已提交的站点已记录 sync_state 并改名，未完成的站点下次重跑，
+          # 且新增走 UPSERT 所以重跑不会产生重复数据。等配额重置即可，不作失败告警。
+          if [ "$code" = "3" ]; then
+            echo "::notice::D1 每日行数配额耗尽，本轮已中止（数据一致，无需人工介入）"
+            exit 0
+          fi
+          exit "$code"
 
       - name: 写入 Job Summary
         if: always()
