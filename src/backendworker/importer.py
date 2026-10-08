@@ -189,7 +189,7 @@ def run(args: argparse.Namespace) -> int:
 
         pending = compute_pending(entries, sync_state)
         if not pending:
-            log.info("所有文件均无更新（upload_at 未变化），空跑保护退出")
+            log.info("所有文件内容均无变化（CSV 未重新清洗），空跑保护退出")
             return 0
         log.info("待处理文件 %d 个：%s", len(pending), ", ".join(e.file_name for e in pending))
 
