@@ -12,6 +12,22 @@
     total      stat_key=''           全表商品数
     market     stat_key=market_id    各交易所商品数
     category   stat_key=category_id  各分类商品数（商品可属多个分类，故各类之和 > 总数属正常）
+
+【平台约束·勿改】D1 把 SQLITE_LIMIT_COMPOUND_SELECT 降到了 5
+    workerd 在 src/workerd/util/sqlite.c++ 的 setupSecurity() 里按
+    sqlite.org/security.html 的「高安全值」下调了一组运行时上限：
+        SQLITE_LIMIT_COMPOUND_SELECT = 5   （本地 SQLite 默认 500）
+        SQLITE_LIMIT_EXPR_DEPTH      = 100
+        SQLITE_LIMIT_VARIABLE_NUMBER = 100
+        SQLITE_LIMIT_ATTACHED        = 0
+        SQLITE_LIMIT_LIKE_PATTERN_LENGTH = 50
+    D1 官方 limits 页面并未列出这一项，只能从 workerd 源码确认。
+
+    因此「把 N 个分类 UNION ALL 串成一条 SELECT」在本地能跑、在 D1 必失败：
+        too many terms in compound SELECT（D1 code 7500）
+    该限制约束的是**一条复合语句里的 SELECT 项数**，与语句条数无关——
+    所以解法是拆成 N 条独立语句一次发出，而不是分批 UNION（分批只是把
+    报错阈值从 35 挪到 5，并没有解决问题）。详见 `_category_counts`。
 """
 
 from __future__ import annotations
@@ -21,6 +37,7 @@ from typing import Sequence
 
 from .d1_client import D1Client, D1Error, QuotaExceeded, chunks, quote
 from .state import now_str
+from .tokenizer import TAG_SEPARATOR
 
 log = logging.getLogger(__name__)
 
@@ -65,6 +82,16 @@ def _category_counts(client: D1Client, category_ids: list[str]) -> list[tuple[st
     为什么能用：product_fts 的 category_id 列存的是「按 || 拆开后空格拼接」的编码，
     FTS5 建立了倒排索引，`MATCH` 查某个编码比 `LIKE '%code%'` 全表扫便宜得多。
 
+    **每个分类一条独立 SELECT，合成一个多语句脚本一次发出** ——
+    不要改成 `UNION ALL` 把 N 个分类串成一条：那会撞上 D1 的
+    SQLITE_LIMIT_COMPOUND_SELECT（见 `_category_counts` 下方说明）。
+    N 条语句各自是单 SELECT，命中数在 D1 侧聚合完再回传，
+    本地只收到 N 行，且不把命中行拉到 Python 内存里分桶。
+
+    为什么不用「一条 MATCH 带 N 个 OR」：那样确实也能绕开 compound select，
+    但 FTS5 命中的是全部商品（每行都带至少一个分类），20 万行会全量回传，
+    响应体十几 MB，还得在本地分桶——比逐个 COUNT(*) 贵得多。
+
     正确性核验（已跑过）：
       - unicode61 会把下划线当分隔符，`ai_service` 被拆成 `ai` `service` 两个 token；
         MATCH 默认是词间 AND，所以查询 `ai_service` 等价于要求两个 token 同时存在。
@@ -74,14 +101,17 @@ def _category_counts(client: D1Client, category_ids: list[str]) -> list[tuple[st
     if not category_ids:
         return []
 
-    union_sql = " UNION ALL ".join(
+    statements = [
         f"SELECT {quote(code)} AS stat_key, COUNT(*) AS cnt "
         f"FROM product_fts WHERE product_fts MATCH {quote(f'category_id:{code}')}"
         for code in category_ids
-    )
+    ]
 
     try:
-        rows = client.query(union_sql)
+        rows: list[dict] = []
+        for part in chunks(statements, client.cfg.batch_size):
+            rows.extend(client.query_script(part))
+            client.pace()
     except QuotaExceeded:
         # 配额耗尽不是 FTS 的问题，回退成 LIKE 全扫描只会白烧 35 次读取配额，
         # 而且结果一样拿不到。直接向上抛，让上层整轮中止。

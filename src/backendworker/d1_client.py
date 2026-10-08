@@ -244,6 +244,49 @@ class D1Client:
         self.stat_rows_returned += len(rows)
         return rows
 
+    def query_script(self, statements: Sequence[str]) -> list[dict[str, Any]]:
+        """把多条只读 SELECT 拼成一个脚本发出去，返回合并后的结果行。
+
+        存在的理由：D1（workerd）把 SQLITE_LIMIT_COMPOUND_SELECT 降到 5，
+        所以「N 个分类 UNION ALL 成一条」会被解析阶段直接拒绝。但 N 条
+        **独立**语句不受该限制约束——它是复合 SELECT 的项数上限，不是
+        语句条数上限。于是「每分类一条 COUNT(*)」既能并行发一次请求拿到结果，
+        又完全绕开该限制。
+
+        与 `execute` 的区别：execute 面向写入且丢弃返回值；本方法面向读取，
+        会把每条语句的 results 平铺返回。多语句响应里每个语句各有一项 result，
+        因此调用方应让每条语句自带区分列（本处是 `stat_key` 别名），
+        这样即便顺序被打乱也不会串行。
+
+        多语句脚本若被拒，会自动降级为逐条查询（语义相同，都是只读），
+        而不是让调用方掉进更贵的兜底路径。
+
+        语句里**不要**写任何写操作：这里没有 execute 的幂等重跑保障，
+        中途失败重发会有重复写风险。
+        """
+        if not statements:
+            return []
+        try:
+            results = self._post({"sql": build_script(statements)})
+        except QuotaExceeded:
+            raise
+        except D1Error as exc:
+            log.warning("多语句只读脚本失败（%s），改用逐条查询", _brief(exc))
+            rows = []
+            for stmt in statements:
+                rows.extend(self.query(stmt))
+            return rows
+        rows: list[dict[str, Any]] = []
+        for item in results:
+            if not item.get("success", True):
+                error = item.get("error")
+                if is_quota_error(error):
+                    raise _quota_error(error)
+                raise D1Error(f"SQL 执行失败：{_brief(error)}")
+            rows.extend(item.get("results") or [])
+        self.stat_rows_returned += len(rows)
+        return rows
+
     # ---- 批量执行（无返回值）
 
     def execute(self, statements: Sequence[str]) -> None:
